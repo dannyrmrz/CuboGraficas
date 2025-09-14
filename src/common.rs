@@ -7,6 +7,7 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
 };
 use bytemuck:: {Pod, Zeroable, cast_slice};
+use image::GenericImageView;
 
 #[path="../src/transforms.rs"]
 mod transforms;
@@ -41,18 +42,20 @@ pub fn light(c:[f32; 3], sc:[f32;3], ai: f32, di: f32, si: f32, ss: f32) -> Ligh
 pub struct Vertex {
     pub position: [f32; 4],
     pub normal: [f32; 4],
+    pub tex_coords: [f32; 2],
 }
 
 #[allow(dead_code)]
-pub fn vertex(p:[f32;3], n:[f32; 3]) -> Vertex {
+pub fn vertex(p:[f32;3], n:[f32; 3], uv: [f32; 2]) -> Vertex {
     Vertex {
         position: [p[0], p[1], p[2], 1.0],
         normal: [n[0], n[1], n[2], 1.0],
+        tex_coords: uv,
     }
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0=>Float32x4, 1=>Float32x4];
+    const ATTRIBUTES: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0=>Float32x4, 1=>Float32x4, 2=>Float32x2];
     fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
@@ -71,11 +74,69 @@ struct State {
     view_mat: Matrix4<f32>,
     project_mat: Matrix4<f32>,
     num_vertices: u32,
+    texture: wgpu::Texture,
+    texture_view: wgpu::TextureView,
+    texture_sampler: wgpu::Sampler,
 }
 
 impl State {
+    async fn load_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+        let img = image::open("src/images/textura.png").unwrap();
+        let rgba = img.to_rgba8();
+        let dimensions = img.dimensions();
+
+        let texture_size = wgpu::Extent3d {
+            width: dimensions.0,
+            height: dimensions.1,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            label: Some("texture"),
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * dimensions.0),
+                rows_per_image: Some(dimensions.1),
+            },
+            texture_size,
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        (texture, view, sampler)
+    }
+
     async fn new(window: &Window, vertex_data: &Vec<Vertex>, light_data: Light) -> Self {        
         let init =  transforms::InitWgpu::init_wgpu(window).await;
+
+        // Load texture
+        let (texture, texture_view, texture_sampler) = Self::load_texture(&init.device, &init.queue).await;
 
         let shader = init.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
@@ -148,6 +209,22 @@ impl State {
                         min_binding_size: None,
                     },
                     count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
                 }
             ],
             label: Some("Uniform Bind Group Layout"),
@@ -167,6 +244,14 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: light_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
                 },
             ],
             label: Some("Uniform Bind Group"),
@@ -230,6 +315,9 @@ impl State {
             view_mat,
             project_mat,
             num_vertices,
+            texture,
+            texture_view,
+            texture_sampler,
         }
     }
 
